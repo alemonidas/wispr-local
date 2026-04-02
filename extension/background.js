@@ -12,6 +12,38 @@ let state = {
   frameId: null,
 }
 
+// ── Keep-alive: impede que o MV3 Service Worker morra por inatividade ──────
+// Chrome termina o SW após ~30s parado. O alarm dispara a cada 25s para mantê-lo ativo.
+chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 }) // ~24s
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'keepAlive') return
+  const exists = await chrome.offscreen.hasDocument()
+  if (!exists) return
+  // Pinga o offscreen doc — se responder, modelo está vivo e quente
+  chrome.runtime.sendMessage({ type: 'PING' }, (res) => {
+    if (chrome.runtime.lastError) return // offscreen morreu silenciosamente
+    if (res?.modelLoaded) {
+      state.modelStatus = 'ready' // confirma que modelo ainda está na memória
+    }
+  })
+})
+
+// ── Auto-restore: recarrega modelo se SW reiniciou com modelo previamente carregado ──
+chrome.storage.local.get(['modelReady', 'modelId', 'language'], async (prefs) => {
+  if (!prefs.modelReady) return
+  state.modelId = prefs.modelId ?? state.modelId
+  state.language = prefs.language ?? state.language
+  state.modelStatus = 'loading'
+  try {
+    await ensureOffscreen()
+    await sendToOffscreen({ type: 'LOAD_MODEL', modelId: state.modelId, language: state.language })
+    state.modelStatus = 'ready'
+  } catch {
+    state.modelStatus = 'idle'
+  }
+})
+
 // ── Offscreen document ────────────────────────────────────────
 async function ensureOffscreen() {
   const existing = await chrome.offscreen.hasDocument()
@@ -41,24 +73,26 @@ async function handleMessage(msg, sender, sendResponse) {
       sendResponse({ ok: true })
       break
 
-    // Content script envia áudio (Float32Array serializado como Array)
+    // Content script envia áudio (base64)
     case 'AUDIO_READY': {
       state.recording = false
       state.modelStatus = 'transcribing'
+      // Usa o tabId do sender direto — funciona mesmo após reinício do SW
+      const targetTabId = sender.tab?.id ?? state.tabId
+      state.tabId = targetTabId
       broadcastStatus()
       try {
         await ensureOffscreen()
         const text = await transcribeInOffscreen(msg.audio, msg.sampleRate)
-        // Envia texto de volta para a aba de origem
-        if (state.tabId !== null) {
-          chrome.tabs.sendMessage(state.tabId, { type: 'TRANSCRIPTION_RESULT', text })
+        if (targetTabId !== null && targetTabId !== undefined) {
+          chrome.tabs.sendMessage(targetTabId, { type: 'TRANSCRIPTION_RESULT', text })
         }
         state.modelStatus = 'ready'
       } catch (err) {
         state.modelStatus = 'error'
         console.error('[VoiceFlow] Erro na transcrição:', err)
-        if (state.tabId !== null) {
-          chrome.tabs.sendMessage(state.tabId, { type: 'TRANSCRIPTION_ERROR', message: String(err) })
+        if (targetTabId !== null && targetTabId !== undefined) {
+          chrome.tabs.sendMessage(targetTabId, { type: 'TRANSCRIPTION_ERROR', message: String(err) })
         }
       }
       broadcastStatus()
@@ -99,6 +133,8 @@ async function handleMessage(msg, sender, sendResponse) {
     // Offscreen avisa que modelo está pronto
     case 'MODEL_READY':
       state.modelStatus = 'ready'
+      // Persiste que o modelo está carregado — sobrevive a reinícios do SW
+      chrome.storage.local.set({ modelReady: true, modelId: state.modelId, language: state.language })
       broadcastStatus()
       sendResponse({ ok: true })
       break

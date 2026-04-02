@@ -73,7 +73,7 @@
       if (audio) {
         chrome.runtime.sendMessage({
           type: 'AUDIO_READY',
-          audio: Array.from(audio), // serializa Float32Array para postMessage
+          audio: float32ToBase64(audio), // base64 — muito mais rápido que Array.from
           sampleRate: 16000,
         })
       }
@@ -224,6 +224,18 @@
 
   function updateIndicator(status) {
     // futuro: atualizar badge ou estado do indicador
+  }
+
+  // Codifica Float32Array como base64 — muito mais rápido que Array.from()
+  // 10s de áudio @ 16kHz = 640KB binário → ~853KB base64 (vs ~2.5MB como array JSON)
+  function float32ToBase64(float32Array) {
+    const bytes = new Uint8Array(float32Array.buffer)
+    let binary = ''
+    const chunk = 0x8000 // 32KB por iteração para evitar stack overflow
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk))
+    }
+    return btoa(binary)
   }
 
   function injectStyle() {
